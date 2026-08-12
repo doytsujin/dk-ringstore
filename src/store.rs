@@ -312,21 +312,145 @@ pub enum Refusal {
 
 // ---------------------------------------------------------------------- reads
 
+/// What a folded window reports, which depends on what kind of signal it is.
+///
+/// A store consolidates more than numbers, so a read has to be able to return
+/// more than numbers. Categorical signals report the class distribution they
+/// collapsed to; vector signals report how far they have moved.
+///
+/// Vector windows deliberately carry **no centroid**. A reading is meant to fit
+/// in a prompt, and a 768-dimensional vector does not — but the more useful
+/// reason is that reporting movement without reporting position discloses
+/// strictly less. Use [`Store::centroid`] when the vector itself is genuinely
+/// needed; it is gated by the same grant.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Summary {
+    /// Nothing was retained, or everything retained was unknown.
+    Empty,
+    Scalar {
+        mean: Option<f64>,
+        min: Option<f64>,
+        max: Option<f64>,
+        variance: Option<f64>,
+    },
+    Categorical {
+        counts: Vec<u64>,
+        dominant: Option<usize>,
+        /// Shannon entropy in nats over the observed classes.
+        entropy: Option<f64>,
+    },
+    Vector {
+        /// Mean squared deviation from this window's own centroid.
+        spread: Option<f64>,
+        /// Distance from the baseline centroid — the coarsest *permitted*
+        /// window of the same signal. `None` on the baseline window itself, and
+        /// wherever no coarser permitted window exists to measure against,
+        /// because a self-comparison is zero and means nothing.
+        drift: Option<f64>,
+    },
+    Clusters {
+        clusters: usize,
+        spread: Option<f64>,
+        drift: Option<f64>,
+    },
+}
+
+impl Summary {
+    fn of(slot: Option<&Slot>, baseline: Option<&[f32]>) -> Summary {
+        match slot {
+            None => Summary::Empty,
+            Some(Slot::Scalar(w)) => Summary::Scalar {
+                mean: w.mean(),
+                min: w.min(),
+                max: w.max(),
+                variance: w.variance(),
+            },
+            Some(Slot::Categorical(c)) => Summary::Categorical {
+                counts: c.counts().to_vec(),
+                dominant: c.dominant(),
+                entropy: c.entropy(),
+            },
+            Some(Slot::Vector(v)) => Summary::Vector {
+                spread: v.variance(),
+                drift: baseline.and_then(|b| v.drift_from(b)),
+            },
+            Some(Slot::Clusters(m)) => {
+                let total = m.total();
+                Summary::Clusters {
+                    clusters: m.len(),
+                    spread: total.variance(),
+                    drift: baseline.and_then(|b| total.drift_from(b)),
+                }
+            }
+        }
+    }
+}
+
 /// One archive's answer.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Window {
     pub resolution_secs: u64,
     /// The span the retained slots cover — resolution × retained slots.
     pub span_secs: u64,
-    pub mean: Option<f64>,
-    pub min: Option<f64>,
-    pub max: Option<f64>,
-    pub variance: Option<f64>,
     /// Constituent observations behind the retained slots.
     pub observations: u64,
     /// True when too few of the retained slots carry data, per the archive's
     /// declared `xff`. Distinct from a mean of zero.
     pub unknown: bool,
+    pub summary: Summary,
+}
+
+impl Window {
+    pub fn mean(&self) -> Option<f64> {
+        match &self.summary {
+            Summary::Scalar { mean, .. } => *mean,
+            _ => None,
+        }
+    }
+
+    pub fn min(&self) -> Option<f64> {
+        match &self.summary {
+            Summary::Scalar { min, .. } => *min,
+            _ => None,
+        }
+    }
+
+    pub fn max(&self) -> Option<f64> {
+        match &self.summary {
+            Summary::Scalar { max, .. } => *max,
+            _ => None,
+        }
+    }
+
+    pub fn variance(&self) -> Option<f64> {
+        match &self.summary {
+            Summary::Scalar { variance, .. } => *variance,
+            _ => None,
+        }
+    }
+
+    /// The most frequent class, for a categorical signal.
+    pub fn dominant(&self) -> Option<usize> {
+        match &self.summary {
+            Summary::Categorical { dominant, .. } => *dominant,
+            _ => None,
+        }
+    }
+
+    pub fn entropy(&self) -> Option<f64> {
+        match &self.summary {
+            Summary::Categorical { entropy, .. } => *entropy,
+            _ => None,
+        }
+    }
+
+    /// Movement from the baseline centroid, for a vector signal.
+    pub fn drift(&self) -> Option<f64> {
+        match &self.summary {
+            Summary::Vector { drift, .. } | Summary::Clusters { drift, .. } => *drift,
+            _ => None,
+        }
+    }
 }
 
 /// What a reader gets: the permitted resolutions, and an explicit note of the
@@ -361,7 +485,7 @@ impl Reading {
     pub fn sigma(&self) -> Option<f64> {
         let now = self.now?;
         let base = self.windows.last()?;
-        let (mean, var) = (base.mean?, base.variance?);
+        let (mean, var) = (base.mean()?, base.variance()?);
         let sd = var.sqrt();
         (sd > 0.0).then(|| (now - mean) / sd)
     }
@@ -578,16 +702,38 @@ impl Store {
             .get(signal)
             .ok_or_else(|| Refusal::UnknownSignal(signal.to_string()))?;
 
-        let mut windows = Vec::new();
+        // Fold the permitted archives first, because the drift baseline is the
+        // coarsest permitted window and a finer window cannot be summarised
+        // until that exists.
+        let mut permitted: Vec<(&ArchiveState, u64, Option<Slot>)> = Vec::new();
         let mut withheld = Vec::new();
         for a in &st.archives {
             let res = a.spec.steps_per_slot as u64 * self.decl.step_secs;
             if grant.permits(res) {
-                windows.push(Self::window(a, res));
+                let folded = a.ring.consolidate();
+                permitted.push((a, res, folded));
             } else {
                 withheld.push(res);
             }
         }
+
+        let baseline: Option<Vec<f32>> = permitted
+            .last()
+            .and_then(|(_, _, folded)| folded.as_ref())
+            .and_then(vector_centroid);
+
+        // The baseline window is not measured against itself. A self-comparison
+        // is exactly zero and means nothing, and a confident zero is worse than
+        // an absent number — the same reason `sigma` declines a flat baseline.
+        let last = permitted.len().saturating_sub(1);
+        let windows: Vec<Window> = permitted
+            .iter()
+            .enumerate()
+            .map(|(i, (a, res, folded))| {
+                let base = if i != last { baseline.as_deref() } else { None };
+                Self::window(a, *res, folded, base)
+            })
+            .collect();
 
         let finest = st.archives[0].spec.steps_per_slot as u64 * self.decl.step_secs;
         let now = grant
@@ -638,7 +784,56 @@ impl Store {
                 granted: grant.granted(),
             });
         }
-        Ok(Self::window(a, resolution_secs))
+        // No baseline: a single archive has nothing coarser to measure against,
+        // so a vector window read this way reports spread and not drift. Use
+        // `read` when drift matters.
+        Ok(Self::window(
+            a,
+            resolution_secs,
+            &a.ring.consolidate(),
+            None,
+        ))
+    }
+
+    /// The centroid of a vector signal at one resolution, under the same grant
+    /// as any other read.
+    ///
+    /// Separate from [`Store::read`] on purpose. A reading is sized to be
+    /// handed to a reader whole; a centroid is not, and it discloses position
+    /// rather than movement. Callers that need the vector should have to ask
+    /// for it.
+    pub fn centroid(
+        &self,
+        signal: &str,
+        resolution_secs: u64,
+        grant: &Grant,
+    ) -> Result<Option<Vec<f32>>, Refusal> {
+        let st = self
+            .signals
+            .get(signal)
+            .ok_or_else(|| Refusal::UnknownSignal(signal.to_string()))?;
+        let offered = self.decl.resolutions_of(signal);
+
+        let a = match st
+            .archives
+            .iter()
+            .find(|a| a.spec.steps_per_slot as u64 * self.decl.step_secs == resolution_secs)
+        {
+            Some(a) => a,
+            None => {
+                return Err(Refusal::NotDeclared {
+                    requested: resolution_secs,
+                    offered,
+                })
+            }
+        };
+        if !grant.permits(resolution_secs) {
+            return Err(Refusal::NotGranted {
+                requested: resolution_secs,
+                granted: grant.granted(),
+            });
+        }
+        Ok(a.ring.consolidate().as_ref().and_then(vector_centroid))
     }
 
     /// Reads and freezes, for a decision record to carry.
@@ -654,28 +849,19 @@ impl Store {
         })
     }
 
-    fn window(a: &ArchiveState, resolution_secs: u64) -> Window {
+    fn window(
+        a: &ArchiveState,
+        resolution_secs: u64,
+        folded: &Option<Slot>,
+        baseline: Option<&[f32]>,
+    ) -> Window {
         let retained = (a.ring.written() as usize).min(a.ring.capacity());
-        let folded = a.ring.consolidate();
-        let (mean, min, max, variance, observations) = match folded.as_ref().and_then(scalar) {
-            Some(w) => (w.mean(), w.min(), w.max(), w.variance(), w.count()),
-            None => (
-                None,
-                None,
-                None,
-                None,
-                folded.as_ref().map_or(0, |s| s.count()),
-            ),
-        };
         Window {
             resolution_secs,
             span_secs: resolution_secs * retained as u64,
-            mean,
-            min,
-            max,
-            variance,
-            observations,
+            observations: folded.as_ref().map_or(0, |s| s.count()),
             unknown: a.ring.is_unknown(a.spec.xff),
+            summary: Summary::of(folded.as_ref(), baseline),
         }
     }
 }
@@ -683,6 +869,15 @@ impl Store {
 fn scalar(slot: &Slot) -> Option<&Welford> {
     match slot {
         Slot::Scalar(w) => Some(w),
+        _ => None,
+    }
+}
+
+/// The centroid a vector-bearing slot collapses to, whatever its exact kind.
+fn vector_centroid(slot: &Slot) -> Option<Vec<f32>> {
+    match slot {
+        Slot::Vector(v) => v.centroid(),
+        Slot::Clusters(m) => m.total().centroid(),
         _ => None,
     }
 }
@@ -773,9 +968,9 @@ mod tests {
 
         // Six closed slots covering steps 0..59; mean of 0..59 is 29.5.
         assert_eq!(coarse.observations, 60);
-        assert!((coarse.mean.unwrap() - 29.5).abs() < 1e-9);
-        assert_eq!(coarse.min, Some(0.0));
-        assert_eq!(coarse.max, Some(59.0));
+        assert!((coarse.mean().unwrap() - 29.5).abs() < 1e-9);
+        assert_eq!(coarse.min(), Some(0.0));
+        assert_eq!(coarse.max(), Some(59.0));
         assert_eq!(coarse.span_secs, 60);
     }
 
@@ -798,17 +993,17 @@ mod tests {
         // filtered from the answer, absent from the store.
         let fine = s.read_at("threat", 1, &g).unwrap();
         assert_eq!(fine.span_secs, 10);
-        assert_eq!(fine.max, Some(1.0));
-        assert_eq!(fine.min, Some(1.0));
+        assert_eq!(fine.max(), Some(1.0));
+        assert_eq!(fine.min(), Some(1.0));
 
         // The coarse archive still carries the spike, consolidated.
         let coarse = s.read_at("threat", 10, &g).unwrap();
-        assert_eq!(coarse.max, Some(1000.0));
+        assert_eq!(coarse.max(), Some(1000.0));
 
         // And a fully granted read cannot surface it at fine resolution either.
         let r = s.read("threat", &g).unwrap();
-        assert_eq!(r.window(1).unwrap().max, Some(1.0));
-        assert_eq!(r.window(10).unwrap().max, Some(1000.0));
+        assert_eq!(r.window(1).unwrap().max(), Some(1.0));
+        assert_eq!(r.window(10).unwrap().max(), Some(1000.0));
     }
 
     #[test]
@@ -821,8 +1016,8 @@ mod tests {
         let g = Grant::all(s.declaration());
         let fine = s.read_at("threat", 1, &g).unwrap();
         assert!(fine.unknown);
-        assert_eq!(fine.mean, None);
-        assert_ne!(fine.mean, Some(0.0));
+        assert_eq!(fine.mean(), None);
+        assert_ne!(fine.mean(), Some(0.0));
     }
 
     // -------------------------------------------------------------- the gate
@@ -862,7 +1057,7 @@ mod tests {
         let r = s.read("threat", &g).unwrap();
         assert_eq!(r.windows.len(), 1);
         assert_eq!(r.windows[0].resolution_secs, 10);
-        assert!((r.windows[0].mean.unwrap() - 3.0).abs() < 1e-9);
+        assert!((r.windows[0].mean().unwrap() - 3.0).abs() < 1e-9);
 
         // The per-second archive is named as withheld — a reader may know the
         // store keeps it — but never valued.
@@ -924,14 +1119,14 @@ mod tests {
         let g = Grant::all(s.declaration());
         let quote = s.quote("threat", &g, 9).unwrap();
         let frozen = quote.clone();
-        assert_eq!(quote.reading.window(1).unwrap().max, Some(1000.0));
+        assert_eq!(quote.reading.window(1).unwrap().max(), Some(1000.0));
 
         // Run long enough that the fine archive has been overwritten entirely.
         ingest(&mut s, 10, 200, 1.0);
         s.flush("threat").unwrap();
 
         let later = s.read("threat", &g).unwrap();
-        assert_eq!(later.window(1).unwrap().max, Some(1.0));
+        assert_eq!(later.window(1).unwrap().max(), Some(1.0));
         assert_ne!(later, quote.reading);
 
         // The record carries the values, not a reference, so it is unchanged.
@@ -993,9 +1188,21 @@ mod tests {
         let r = s.read("outcome", &g).unwrap();
         assert_eq!(r.withheld, vec![1]);
         assert_eq!(r.windows.len(), 1);
-        // Non-scalar kinds carry no mean, but the observation count is real.
-        assert_eq!(r.windows[0].mean, None);
         assert_eq!(r.windows[0].observations, 8);
+
+        // A categorical window reports the distribution it collapsed to, not a
+        // mean it does not have.
+        assert_eq!(r.windows[0].mean(), None);
+        assert_eq!(r.windows[0].dominant(), Some(0)); // 4 and 4; ties take the lower index
+        assert!((r.windows[0].entropy().unwrap() - 2f64.ln()).abs() < 1e-12);
+        assert_eq!(
+            r.windows[0].summary,
+            Summary::Categorical {
+                counts: vec![4, 4, 0, 0],
+                dominant: Some(0),
+                entropy: Some(2f64.ln()),
+            }
+        );
 
         assert_eq!(
             s.read_at("intent", 1, &g),
@@ -1012,6 +1219,101 @@ mod tests {
         assert!(matches!(
             s.observe("intent", 9, Observation::Scalar(1.0)),
             Err(Refusal::WrongKind { .. })
+        ));
+    }
+
+    #[test]
+    fn a_vector_window_reports_movement_and_not_position() {
+        let d = Declaration::new(
+            1,
+            vec![SignalSpec::vector(
+                "intent",
+                2,
+                Quant::F32,
+                vec![ArchiveSpec::new(1, 4), ArchiveSpec::new(4, 4)],
+            )],
+        );
+        let mut s = Store::new(d).unwrap();
+
+        // Four steps at the origin, then four a long way off.
+        for t in 0..4u64 {
+            s.observe("intent", t, Observation::Vector(vec![0.0, 0.0]))
+                .unwrap();
+        }
+        for t in 4..8u64 {
+            s.observe("intent", t, Observation::Vector(vec![10.0, 0.0]))
+                .unwrap();
+        }
+        s.flush("intent").unwrap();
+
+        let g = Grant::all(s.declaration());
+        let r = s.read("intent", &g).unwrap();
+
+        // The fine archive retains only the recent four; the coarse one still
+        // averages both halves. So the fine window has visibly moved away from
+        // the baseline, which is what an agent actually wants to know.
+        let fine = r.window(1).unwrap();
+        let coarse = r.window(4).unwrap();
+        assert_eq!(coarse.observations, 8);
+        assert_eq!(coarse.drift(), None); // it is the baseline; not measured against itself
+        let moved = fine.drift().unwrap();
+        assert!((moved - 5.0).abs() < 1e-4, "{moved}");
+
+        // The reading carries no vector, by design.
+        assert!(matches!(fine.summary, Summary::Vector { .. }));
+        assert_eq!(fine.mean(), None);
+        assert_eq!(fine.dominant(), None);
+
+        // The centroid is available, separately, under the same grant.
+        let c = s.centroid("intent", 1, &g).unwrap().unwrap();
+        assert!((c[0] - 10.0).abs() < 1e-4, "{c:?}");
+        assert_eq!(
+            s.centroid("intent", 1, &Grant::none()),
+            Err(Refusal::NotGranted {
+                requested: 1,
+                granted: vec![]
+            })
+        );
+        assert!(matches!(
+            s.centroid("intent", 99, &g),
+            Err(Refusal::NotDeclared { .. })
+        ));
+    }
+
+    #[test]
+    fn drift_needs_a_coarser_permitted_window_to_measure_against() {
+        let d = Declaration::new(
+            1,
+            vec![SignalSpec::vector(
+                "intent",
+                2,
+                Quant::F32,
+                vec![ArchiveSpec::new(1, 4), ArchiveSpec::new(4, 4)],
+            )],
+        );
+        let mut s = Store::new(d).unwrap();
+        for t in 0..8u64 {
+            s.observe("intent", t, Observation::Vector(vec![t as f32, 0.0]))
+                .unwrap();
+        }
+        s.flush("intent").unwrap();
+
+        // Granted only the fine resolution, there is no baseline, and the
+        // window says so rather than inventing one.
+        let fine_only = Grant::none().allow(1);
+        let r = s.read("intent", &fine_only).unwrap();
+        assert_eq!(r.window(1).unwrap().drift(), None);
+        assert_eq!(r.withheld, vec![4]);
+
+        // read_at is a single archive, so it reports spread and never drift.
+        let w = s.read_at("intent", 1, &fine_only).unwrap();
+        assert_eq!(w.drift(), None);
+        assert!(matches!(
+            w.summary,
+            Summary::Vector {
+                spread: Some(_),
+                ..
+            }
         ));
     }
 }

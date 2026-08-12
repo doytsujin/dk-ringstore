@@ -65,6 +65,14 @@ declares the fraction of unknown constituents it tolerates before a slot itself
 reads unknown. Absence reaches the reader as absence. This matters more than it
 sounds: a consumer handed a zero will treat it as a measurement.
 
+**Reads report what the signal actually is.** A scalar window carries mean, min,
+max and variance; a categorical window carries the class counts, the dominant
+class and the entropy; a vector window carries spread and drift from the
+coarsest permitted window. A vector window carries no centroid — reporting
+movement discloses less than reporting position, and a 768-dimensional vector
+does not belong in a reading meant to be handed over whole. Ask for the centroid
+separately, under the same grant.
+
 **Reads gated by resolution.** A `Grant` names the resolutions a reader may see
 and is empty by default. Withheld resolutions are named in the reading and never
 valued, so a refusal is distinguishable from missing data — and the current

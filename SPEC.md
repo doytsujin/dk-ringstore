@@ -132,6 +132,20 @@ samples recreates the problem the store exists to solve.
 A read returns a **temporal context surface**: per signal, a small fixed struct
 sized to sit in a prompt.
 
+Because a store consolidates more than numbers, a window reports whatever kind
+of thing it actually is. A scalar window carries mean, min, max and variance. A
+categorical window carries the class counts it collapsed to, the dominant class
+and the entropy. A vector window carries spread and **drift** — distance from
+the coarsest permitted window's centroid — and deliberately carries no centroid
+at all, since a reading is meant to be handed over whole and reporting movement
+discloses strictly less than reporting position. The centroid is a separate
+request, under the same grant.
+
+Drift is absent rather than zero on the baseline window itself, and wherever no
+coarser permitted window exists to measure against. A self-comparison is exactly
+zero and means nothing, and a confident zero is worse than an absent number —
+the same rule that makes a deviation against a flat baseline unanswerable.
+
 ```
 threat:
   now         0.84
