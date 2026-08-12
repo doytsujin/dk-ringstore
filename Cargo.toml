@@ -1,0 +1,14 @@
+[package]
+name = "ringstore"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Bounded temporal memory: several resolutions of a signal in a store whose footprint is fixed at creation, consolidating as data ages, with reads gated per resolution. Scalar, categorical and embedding-centroid consolidation. Pure, dependency-free."
+keywords = ["time-series", "telemetry", "retention", "downsampling", "observability"]
+categories = ["data-structures", "database-implementations"]
+repository = "https://github.com/doytsujin/dk-ringstore"
+readme = "README.md"
+
+[dependencies]
+
+[dev-dependencies]
